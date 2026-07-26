@@ -1,117 +1,128 @@
 import os
-import requests
-import chromadb
+from dotenv import load_dotenv
 import streamlit as st
-from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_postgres import PGVector
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# --- 1. PAGE CONFIGURATION ---
-st.set_page_config(page_title="Local RAG Chatbot", page_icon="🤖", layout="centered")
-st.title("🤖 My Private Knowledge Base")
-st.caption("A 100% free, local RAG system running on your laptop via Ollama.")
+# 1. Load environment variables for local development (.env file)
+load_dotenv()
 
-# --- 2. INITIALISE DATABASE & EMBEDDINGS ---
+# Retrieve credentials securely (supports both .env and Streamlit secrets safely)
+DB_URI = os.getenv("DB_URI")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+try:
+  if not DB_URI and "DB_URI" in st.secrets:
+    DB_URI = st.secrets["DB_URI"]
+  if not OPENAI_API_KEY and "OPENAI_API_KEY" in st.secrets:
+    OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+except Exception:
+  pass
+
+# 2. Configure Streamlit Page
+st.set_page_config(
+    page_title="RAG Assistant with AWS RDS PostgreSQL & OpenRouter",
+    layout="wide",
+)
+st.title("🧠 RAG Assistant with AWS RDS PostgreSQL")
+
+# Validation check
+if not DB_URI or not OPENAI_API_KEY:
+  st.error(
+      "Missing configuration! Please check that DB_URI and OPENAI_API_KEY are"
+      " set in your .env file or Streamlit secrets."
+  )
+  st.stop()
+
+
+# 3. Initialize Embeddings and Vector Store via OpenRouter
 @st.cache_resource
-def init_rag():
-    """Connects to the database once and keeps it in cache for speed."""
-    db_path = os.path.join(os.getcwd(), "my_local_db")
-    client = chromadb.PersistentClient(path=db_path)
-    
-    ollama_embedding = OllamaEmbeddingFunction(
-        url="http://localhost:11434/api/embeddings",
-        model_name="nomic-embed-text"
+def init_vector_store():
+  embeddings = OpenAIEmbeddings(
+      model="openai/text-embedding-3-small",
+      openai_api_key=OPENAI_API_KEY,
+      base_url="https://openrouter.ai/api/v1",
+      check_embedding_ctx_length=False,
+  )
+  vector_store = PGVector(
+      embeddings=embeddings,
+      collection_name="rag_documents",
+      connection=DB_URI,
+      use_jsonb=True,
+  )
+  return vector_store
+
+
+vector_store = init_vector_store()
+retriever = vector_store.as_retriever(
+    search_type="similarity", search_kwargs={"k": 3}
+)
+
+# 4. Sidebar: Add Documents to RDS PostgreSQL
+st.sidebar.header("📁 Knowledge Base Manager")
+uploaded_text = st.sidebar.text_area(
+    "Paste text chunks to add to your database:"
+)
+
+if st.sidebar.button("Add to RDS Database"):
+  if uploaded_text:
+    with st.spinner("Processing and storing embeddings..."):
+      text_splitter = RecursiveCharacterTextSplitter(
+          chunk_size=500, chunk_overlap=50
+      )
+      docs = text_splitter.create_documents([uploaded_text])
+      vector_store.add_documents(docs)
+      st.sidebar.success(
+          f"Successfully stored {len(docs)} chunks into AWS RDS!"
+      )
+  else:
+    st.sidebar.warning("Please enter text before submitting.")
+
+# 5. Main Interface: RAG Query & Chat
+st.subheader("💬 Ask Your Documents")
+query = st.text_input("Enter your question:")
+
+if query:
+  with st.spinner("Searching AWS RDS and generating answer..."):
+    # Retrieve relevant document chunks from PostgreSQL
+    relevant_docs = retriever.invoke(query)
+
+    # Initialize LLM via OpenRouter
+    llm = ChatOpenAI(
+        model="openai/gpt-4o-mini",
+        temperature=0,
+        openai_api_key=OPENAI_API_KEY,
+        base_url="https://openrouter.ai/api/v1",
     )
-    
-    collection = client.get_or_create_collection(
-        name="my_free_knowledge_base", 
-        embedding_function=ollama_embedding
-    )
-    return collection
 
-collection = init_rag()
+    # Construct Prompt
+    template = """Answer the question based only on the following context:
+    {context}
 
-# --- 3. SIDEBAR: FILE UPLOADER & STATS ---
-with st.sidebar:
-    st.header("📂 Document Management")
-    st.markdown("Upload fresh text or markdown files directly into your local vector database.")
-    
-    uploaded_file = st.file_uploader("Choose a file", type=["txt", "md"])
-    
-    if uploaded_file is not None:
-        file_contents = uploaded_file.read().decode("utf-8")
-        file_name = uploaded_file.name
-        
-        if st.button("Ingest File", type="primary"):
-            with st.spinner(f"Embedding and storing {file_name}..."):
-                try:
-                    # Upsert ensures that re-uploading an updated file overwrites the old version
-                    collection.upsert(
-                        documents=[file_contents],
-                        ids=[file_name],
-                        metadatas=[{"source": file_name}]
-                    )
-                    st.success(f"Successfully added **{file_name}**!")
-                except Exception as e:
-                    st.error(f"Error adding file: {e}")
+    Question: {question}
+    """
+    prompt = ChatPromptTemplate.from_template(template)
 
-    st.markdown("---")
-    st.markdown("### 📊 Database Status")
-    try:
-        doc_count = collection.count()
-        st.metric(label="Stored Documents", value=doc_count)
-    except Exception:
-        st.metric(label="Stored Documents", value="Unavailable")
 
-# --- 4. CHAT HISTORY MANAGEMENT ---
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {"role": "assistant", "content": "Ask me anything about your loaded documents, or upload a new file in the sidebar!"}
-    ]
+    def format_docs(docs):
+      return "\n\n".join(doc.page_content for doc in docs)
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.write(msg["content"])
 
-# --- 5. HANDLE USER INPUT ---
-if user_question := st.chat_input("Type your question here..."):
-    
-    with st.chat_message("user"):
-        st.write(user_question)
-    st.session_state.messages.append({"role": "user", "content": user_question})
+    context_text = format_docs(relevant_docs)
+    formatted_prompt = prompt.format(context=context_text, question=query)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Searching local files and thinking..."):
-            
-            # A. Retrieve relevant text chunks
-            results = collection.query(query_texts=[user_question], n_results=1)
-            retrieved_context = results['documents'][0] if results['documents'] and results['documents'][0] else "No relevant context found."
-            
-            # B. Build the prompt for Llama 3.2
-            system_prompt = f"""
-            You are a helpful assistant. Answer the user's question using ONLY the provided Context. 
-            If the context doesn't contain the answer, say 'I don't know'.
+    # Generate response
+    response = llm.invoke(formatted_prompt)
 
-            Context: {retrieved_context}
-            Question: {user_question}
-            """
-            
-            # C. Send to local Ollama API
-            try:
-                response = requests.post(
-                    "http://localhost:11434/api/generate",
-                    json={
-                        "model": "llama3.2",
-                        "prompt": system_prompt,
-                        "stream": False
-                    },
-                    timeout=30
-                )
-                ai_answer = response.json()['response']
-            except Exception as e:
-                ai_answer = f"⚠️ Error connecting to Ollama: {str(e)}. Make sure Ollama is running in your terminal."
+    # Display Answer
+    st.write("### Answer:")
+    st.write(response.content)
 
-            st.write(ai_answer)
-            
-            with st.expander("📚 View retrieved source context used for this answer"):
-                st.info(retrieved_context)
-
-    st.session_state.messages.append({"role": "assistant", "content": ai_answer})
+    # Display Source Context in an Expander
+    with st.expander("View Retrieved Context Chunks from RDS"):
+      for i, doc in enumerate(relevant_docs):
+        st.markdown(f"**Chunk {i+1}:**")
+        st.write(doc.page_content)
