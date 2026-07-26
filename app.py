@@ -11,8 +11,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 load_dotenv()
 
 # Retrieve credentials securely (supports both .env and Streamlit secrets safely)
-DB_URI = os.getenv("DB_URI")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DB_URI = os.getenv("DB_URI") or st.secrets.get("DATABASE_URL")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY")
 
 try:
   if not DB_URI and "DB_URI" in st.secrets:
