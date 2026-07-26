@@ -5,3 +5,4 @@ langchain-text-splitters
 langchain-openai
 numpy
 python-dotenv
+langchain_postgres
